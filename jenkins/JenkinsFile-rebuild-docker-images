@@ -1,0 +1,302 @@
+#!groovy
+// -*- mode: groovy -*-
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Command to rebuild a docker container
+docker_build = 'docker/build.sh'
+
+// Global variable to store the Docker tag generated
+// by this build.
+TVM_DOCKER_TAG=""
+
+
+def per_exec_ws(folder) {
+  return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
+}
+
+
+def upload_to_docker_hub(image_type) {
+  // 'docker/build.sh' makes some assumptions on the images produced.
+  // The expected name is composed by ${BUILD_TAG}.${image_type}:${TVM_DOCKER_TAG}
+
+  sh """
+    docker login -u ${DOCKERHUB_USER} -p ${DOCKERHUB_KEY} ${DOCKERHUB_HOST}
+
+    docker tag \
+      ${BUILD_TAG}.${image_type}:${TVM_DOCKER_TAG} \
+      ${DOCKERHUB_USER}/${image_type}:${TVM_DOCKER_TAG}
+
+    docker push ${DOCKERHUB_USER}/${image_type}:${TVM_DOCKER_TAG}
+  """
+}
+
+
+def cleanup_docker_image(image_name) {
+  // Remove a docker image from the local machine.
+  // With the use of -f, makes it not fail in case the image
+  // does not exist.
+
+  sh """
+    docker rmi -f ${image_name}
+  """
+}
+
+
+def init_git() {
+  // Add more info about job node
+  sh """
+     echo "INFO: NODE_NAME=${NODE_NAME} EXECUTOR_NUMBER=${EXECUTOR_NUMBER}"
+     """
+
+  sh "git clone ${TVM_GIT_REPO_URL}"
+
+  dir('tvm') {
+    script{
+      // At the beginning of a build, the $TVM_CURRENT_REF is set
+      // so that all images are generated using strictly the same
+      // TVM git revision.
+      sh "git checkout ${TVM_CURRENT_REF}"
+    }
+  } // dir
+}
+
+
+pipeline {
+  agent { node { label 'CPU' } }
+
+  options {
+      timestamps()
+  }
+
+  environment {
+      DOCKERHUB_HOST = "registry-1.docker.io"
+      DOCKERHUB_USER = "" // credentials('dockerhub-tlcpack-user')
+      DOCKERHUB_KEY = "" //  credentials('dockerhub-tlcpack-key')
+  }
+
+  parameters {
+    string(name:"TVM_GIT_REPO_URL",
+           defaultValue: "https://github.com/apache/tvm",
+           description: 'Git repository to clone.')
+    string(name:"TVM_GIT_REV",
+           defaultValue: "main",
+           description: 'Git revision to checkout.')
+    string(name:"NOTIFICATION_LIST",
+           defaultValue: "leandro.nunes@arm.com",
+           description: 'Comma-separated list of e-mails to be notified by the end of this job.')
+  }
+
+  stages {
+
+    stage('Prepare') {
+      agent { node { label 'CPU' } }
+      steps {
+        ws(per_exec_ws("tvm/docker-prepare")) {
+          sh "git clone ${TVM_GIT_REPO_URL}"
+          dir('tvm'){
+            script{
+              TVM_CURRENT_REF = sh (
+                script: 'git rev-parse HEAD',
+                returnStdout: true
+              ).trim()
+
+              TIMESTAMP_TAG = sh (
+                script: 'date "+%Y_%m_%d-%H%M%S"',
+                returnStdout: true
+              ).trim()
+
+              TVM_CURRENT_SHORT_REF = sh (
+                script: 'git rev-parse --short HEAD',
+                returnStdout: true
+              ).trim()
+
+              currentBuild.displayName = "${TVM_CURRENT_SHORT_REF}"
+              TVM_DOCKER_TAG = "${TIMESTAMP_TAG}-${TVM_CURRENT_SHORT_REF}"
+              
+            }
+          }
+        }
+      } // steps
+      post {
+        always {
+          cleanWs();
+        }
+      } // post
+    } // stage: Prepare
+
+    stage('Build') {
+      parallel {
+
+        stage('ci-cpu') {
+          agent { node { label 'CPU' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-cpu")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_cpu --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_gpu");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_cpu:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+        stage('ci-gpu') {
+          agent { node { label 'GPUBUILD' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-gpu")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_gpu --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_gpu");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_gpu:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+        stage('ci-lint') {
+          agent { node { label 'CPU' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-lint")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_lint --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_lint");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_lint:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+        stage('ci-wasm') {
+          agent { node { label 'CPU' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-wasm")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_wasm --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_wasm");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_wasm:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+        stage('ci-i386') {
+          agent { node { label 'CPU' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-i386")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_i386 --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_i386");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_i386:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+        stage('ci-arm') {
+          agent { node { label 'ARM' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-arm")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_arm --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_arm");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_arm:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+        stage('ci-qemu') {
+          agent { node { label 'CPU' } }
+          steps {
+            ws(per_exec_ws("tvm/docker-ci-qemu")) {
+              init_git()
+              dir('tvm'){
+                sh "${docker_build} ci_qemu --tag ${TVM_DOCKER_TAG}"
+              }
+
+              upload_to_docker_hub("ci_qemu");
+
+            }
+          } // steps
+          post {
+            always {
+              cleanup_docker_image("${BUILD_TAG}.ci_qemu:${TVM_DOCKER_TAG}");
+              cleanWs();
+            }
+          } // post
+        } // stage
+
+      } // parallel
+    } // stage: Build
+  } // stages
+  post {
+    always {
+      emailext to: '${NOTIFICATION_LIST}', subject: '${DEFAULT_SUBJECT}', body: '${DEFAULT_CONTENT}';
+      cleanWs();
+    }
+  } // post
+} // pipeline
